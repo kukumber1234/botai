@@ -1,0 +1,176 @@
+# python/api.py
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from pathlib import Path
+from dotenv import load_dotenv
+import requests, traceback, pickle, numpy as np
+import time, os
+
+load_dotenv()
+
+OLLAMA_GENERATE_URL = "http://127.0.0.1:11434/api/generate"
+MODEL_NAME = "llama3:8b"
+
+K_TOP = 4 # сколько фрагментов взять
+MAX_CTX_TOTAL = 600       # символы
+MAX_CHUNK_CHARS = 500    
+
+# Генерация
+REQUEST_TIMEOUT = 180  
+NUM_PREDICT = 120
+
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT")
+
+FALLBACK_EMPTY = os.getenv("FALLBACK_EMPTY")
+NO_CONTEXT = os.getenv("NO_CONTEXT")
+SERVICE_BUSY = os.getenv("SERVICE_BUSY")
+
+class QuestionRequest(BaseModel):
+    question: str
+
+class AnswerResponse(BaseModel):
+    answer: str
+
+BASE_DIR = Path(__file__).parent
+STORE_DIR = BASE_DIR / "rag_store"
+
+try:
+    with open(STORE_DIR / "index.pkl", "rb") as f:
+        store = pickle.load(f)
+    with open(STORE_DIR / "meta.pkl", "rb") as f:
+        DOCS = pickle.load(f)
+except Exception as e:
+    raise RuntimeError(f"Не удалось загрузить индекс из {STORE_DIR}: {e}")
+
+VEC = store["vec"]
+X = store["X"]
+
+app = FastAPI()
+
+
+def _truncate(s: str, limit: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= limit:
+        return s
+    cut = s[:limit]
+    dot = cut.rfind(".")
+    if dot >= int(limit * 0.5):
+        cut = cut[:dot+1]
+    return cut + " …"
+
+def retrieve(query: str, k: int = K_TOP):
+    qv = VEC.transform([query])
+    scores = (X @ qv.T).toarray().ravel()
+    top_idx = np.argsort(-scores)[:k]
+    results = []
+    for idx in top_idx:
+        d = DOCS[int(idx)]
+        results.append({
+            "law": d.get("law",""),
+            "chapter": d.get("chapter",""),
+            "article": d.get("article",""),
+            "text": d.get("text",""),
+            "score": float(scores[idx]),
+        })
+    return results
+
+def build_context(found):
+    parts, cites = [], []
+    used = 0
+    for r in found:
+        head = r['article'] or r.get('chapter','')
+        body = _truncate(r["text"], MAX_CHUNK_CHARS)
+        piece = f"[{r['law']} — {head}] {body}".strip()
+        if not piece:
+            continue
+        if used + len(piece) > MAX_CTX_TOTAL:
+            break
+        parts.append(piece)
+        cites.append(f"[{r['law']}, {head}]")
+        used += len(piece)
+    ctx = "\n---\n".join(parts)
+    cite_str = " ".join(cites) if cites else "[]"
+    return ctx, cite_str
+
+def make_prompt(system_prompt: str, ctx: str, question: str, cites: str) -> str:
+    return (
+        f"{system_prompt}\n\n"
+        f"КОНТЕКСТ:\n{ctx}\n\n"
+        f"ВОПРОС: {question}\n\n"
+        f"Сформулируй краткий ответ строго по контексту (до 3–5 предложений). "
+        f"Если в контексте нет ответа — откажись фоазой из инструкции."
+    )
+
+def call_ollama_generate(prompt: str, retry: int = 1) -> str:
+    payload = {
+        "model": MODEL_NAME,
+        "prompt": prompt,
+        "stream": False,
+        "keep_alive": "5m",
+        "options": {
+            "num_ctx": 1024,
+            "num_predict": NUM_PREDICT,
+            "num_thread": 4,
+            "temperature": 0.2,
+            "repeat_penalty": 1.1,
+        },
+    }
+
+    last_err = None
+    for attempt in range(retry + 1):
+        try:
+            resp = requests.post(OLLAMA_GENERATE_URL, json=payload, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            return (data.get("response") or "").strip()
+        except requests.ReadTimeout as e:
+            last_err = e
+            time.sleep(2)
+        except Exception as e:
+            last_err = e
+            break
+
+    raise HTTPException(status_code=503, detail=f"Ollama недоступен: {last_err}")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.on_event("startup")
+def warmup_model():
+    # Лёгкий прогрев модели — ускоряет запрос
+    try:
+        _ = call_ollama_generate("Скажи 'OK'. Ответ одним словом: OK", retry=0)
+    except Exception:
+        pass
+
+
+@app.post("/ask", response_model=AnswerResponse)
+async def ask_question(request: QuestionRequest):
+    question = (request.question or "").strip()
+    if not question:
+        return {"answer": FALLBACK_EMPTY}
+
+    found = retrieve(question, k=K_TOP)
+    if not found:
+        return {"answer": NO_CONTEXT}
+
+    ctx, cites = build_context(found)
+    if not ctx.strip():
+        return {"answer": NO_CONTEXT}
+
+    prompt = make_prompt(SYSTEM_PROMPT, ctx, question, cites)
+
+    try:
+        answer = call_ollama_generate(prompt, retry=1)
+        if not answer:
+            return {"answer": NO_CONTEXT}
+        return {"answer": answer}
+    except HTTPException as e:
+        if e.status_code == 503:
+            return {"answer": SERVICE_BUSY}
+        raise
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервиса")
