@@ -1,26 +1,25 @@
-# python/api.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pathlib import Path
 from dotenv import load_dotenv
+from scipy.sparse import hstack
+from contextlib import asynccontextmanager
 import requests, traceback, pickle, numpy as np
 import time, os
 
 load_dotenv()
 
 OLLAMA_GENERATE_URL = "http://127.0.0.1:11434/api/generate"
-MODEL_NAME = "llama3:8b"
+MODEL_NAME = "llama3:8b" 
 
-K_TOP = 4 # сколько фрагментов взять
-MAX_CTX_TOTAL = 600       # символы
-MAX_CHUNK_CHARS = 500    
+K_TOP = 4
+MAX_CTX_TOTAL = 3000    # символы
+MAX_CHUNK_CHARS = 800
 
-# Генерация
-REQUEST_TIMEOUT = 180  
+REQUEST_TIMEOUT = 120
 NUM_PREDICT = 120
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT")
-
 FALLBACK_EMPTY = os.getenv("FALLBACK_EMPTY")
 NO_CONTEXT = os.getenv("NO_CONTEXT")
 SERVICE_BUSY = os.getenv("SERVICE_BUSY")
@@ -42,11 +41,29 @@ try:
 except Exception as e:
     raise RuntimeError(f"Не удалось загрузить индекс из {STORE_DIR}: {e}")
 
-VEC = store["vec"]
+VEC_WORD = store["vec_word"]
+VEC_CHAR = store["vec_char"]
 X = store["X"]
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
+    try:
+        _ = requests.post(
+            OLLAMA_GENERATE_URL,
+            json={
+                "model": MODEL_NAME,
+                "prompt": "Скажи 'ОК'. Ответ одним словом: ОК",
+                "stream": False,
+                "options": {"num_ctx": 256, "num_predict": 5},
+            },
+            timeout=15,
+        )
+    except Exception:
+        pass
+    yield
 
+app = FastAPI(lifespan=lifespan)
 
 def _truncate(s: str, limit: int) -> str:
     s = (s or "").strip()
@@ -59,7 +76,9 @@ def _truncate(s: str, limit: int) -> str:
     return cut + " …"
 
 def retrieve(query: str, k: int = K_TOP):
-    qv = VEC.transform([query])
+    qw = VEC_WORD.transform([query])
+    qc = VEC_CHAR.transform([query])
+    qv = hstack([qw, qc], format="csr")
     scores = (X @ qv.T).toarray().ravel()
     top_idx = np.argsort(-scores)[:k]
     results = []
@@ -97,8 +116,8 @@ def make_prompt(system_prompt: str, ctx: str, question: str, cites: str) -> str:
         f"{system_prompt}\n\n"
         f"КОНТЕКСТ:\n{ctx}\n\n"
         f"ВОПРОС: {question}\n\n"
-        f"Сформулируй краткий ответ строго по контексту (до 3–5 предложений). "
-        f"Если в контексте нет ответа — откажись фоазой из инструкции."
+        f"Сформулируй ответ строго по контексту. "
+        f"Если в контексте нет ответа — откажись фразой из инструкции."
     )
 
 def call_ollama_generate(prompt: str, retry: int = 1) -> str:
@@ -108,14 +127,13 @@ def call_ollama_generate(prompt: str, retry: int = 1) -> str:
         "stream": False,
         "keep_alive": "5m",
         "options": {
-            "num_ctx": 1024,
+            "num_ctx": 2048,
             "num_predict": NUM_PREDICT,
             "num_thread": 4,
             "temperature": 0.2,
             "repeat_penalty": 1.1,
         },
     }
-
     last_err = None
     for attempt in range(retry + 1):
         try:
@@ -129,22 +147,11 @@ def call_ollama_generate(prompt: str, retry: int = 1) -> str:
         except Exception as e:
             last_err = e
             break
-
     raise HTTPException(status_code=503, detail=f"Ollama недоступен: {last_err}")
-
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
-@app.on_event("startup")
-def warmup_model():
-    # Лёгкий прогрев модели — ускоряет запрос
-    try:
-        _ = call_ollama_generate("Скажи 'OK'. Ответ одним словом: OK", retry=0)
-    except Exception:
-        pass
-
 
 @app.post("/ask", response_model=AnswerResponse)
 async def ask_question(request: QuestionRequest):
