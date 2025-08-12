@@ -1,23 +1,24 @@
+# python/api.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pathlib import Path
 from dotenv import load_dotenv
-from scipy.sparse import hstack
-from contextlib import asynccontextmanager
+from sentence_transformers import SentenceTransformer
+import faiss
 import requests, traceback, pickle, numpy as np
 import time, os
 
 load_dotenv()
 
 OLLAMA_GENERATE_URL = "http://127.0.0.1:11434/api/generate"
-MODEL_NAME = "llama3:8b" 
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3:8b")
 
-K_TOP = 4
-MAX_CTX_TOTAL = 3000    # символы
-MAX_CHUNK_CHARS = 800
+K_TOP = int(os.getenv("K_TOP", "8"))
+MAX_CTX_TOTAL = int(os.getenv("MAX_CTX_TOTAL", "3000"))   # символы
+MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "800"))
 
-REQUEST_TIMEOUT = 120
-NUM_PREDICT = 120
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "120"))
+NUM_PREDICT = int(os.getenv("NUM_PREDICT", "300"))
 
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT")
 FALLBACK_EMPTY = os.getenv("FALLBACK_EMPTY")
@@ -33,37 +34,21 @@ class AnswerResponse(BaseModel):
 BASE_DIR = Path(__file__).parent
 STORE_DIR = BASE_DIR / "rag_store"
 
+# Загрузка индекса и метаданных
 try:
-    with open(STORE_DIR / "index.pkl", "rb") as f:
-        store = pickle.load(f)
+    faiss_index = faiss.read_index(str(STORE_DIR / "faiss.index"))
     with open(STORE_DIR / "meta.pkl", "rb") as f:
         DOCS = pickle.load(f)
+    emb_model_name_path = STORE_DIR / "model_name.txt"
+    if emb_model_name_path.exists():
+        with open(emb_model_name_path, "r", encoding="utf-8") as f:
+            EMB_MODEL_NAME = f.read().strip()
+    else:
+        EMB_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 except Exception as e:
     raise RuntimeError(f"Не удалось загрузить индекс из {STORE_DIR}: {e}")
 
-VEC_WORD = store["vec_word"]
-VEC_CHAR = store["vec_char"]
-X = store["X"]
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # startup
-    try:
-        _ = requests.post(
-            OLLAMA_GENERATE_URL,
-            json={
-                "model": MODEL_NAME,
-                "prompt": "Скажи 'ОК'. Ответ одним словом: ОК",
-                "stream": False,
-                "options": {"num_ctx": 256, "num_predict": 5},
-            },
-            timeout=15,
-        )
-    except Exception:
-        pass
-    yield
-
-app = FastAPI(lifespan=lifespan)
+emb_model = SentenceTransformer(EMB_MODEL_NAME)
 
 def _truncate(s: str, limit: int) -> str:
     s = (s or "").strip()
@@ -76,20 +61,21 @@ def _truncate(s: str, limit: int) -> str:
     return cut + " …"
 
 def retrieve(query: str, k: int = K_TOP):
-    qw = VEC_WORD.transform([query])
-    qc = VEC_CHAR.transform([query])
-    qv = hstack([qw, qc], format="csr")
-    scores = (X @ qv.T).toarray().ravel()
-    top_idx = np.argsort(-scores)[:k]
+    qv = emb_model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+    distances, indices = faiss_index.search(qv, k)
+    idxs = indices[0]
+    scores = distances[0]
     results = []
-    for idx in top_idx:
+    for i, idx in enumerate(idxs):
+        if idx < 0 or idx >= len(DOCS):
+            continue
         d = DOCS[int(idx)]
         results.append({
             "law": d.get("law",""),
             "chapter": d.get("chapter",""),
             "article": d.get("article",""),
             "text": d.get("text",""),
-            "score": float(scores[idx]),
+            "score": float(scores[i]),
         })
     return results
 
@@ -116,7 +102,8 @@ def make_prompt(system_prompt: str, ctx: str, question: str, cites: str) -> str:
         f"{system_prompt}\n\n"
         f"КОНТЕКСТ:\n{ctx}\n\n"
         f"ВОПРОС: {question}\n\n"
-        f"Сформулируй ответ строго по контексту. "
+        f"Сформулируй ответ строго по контексту. Ответь как можно меньше но не потеряй смысл. "
+        f"Закончи ответ полностью. Не обрывай предложение. "
         f"Если в контексте нет ответа — откажись фразой из инструкции."
     )
 
@@ -148,6 +135,8 @@ def call_ollama_generate(prompt: str, retry: int = 1) -> str:
             last_err = e
             break
     raise HTTPException(status_code=503, detail=f"Ollama недоступен: {last_err}")
+
+app = FastAPI()
 
 @app.get("/health")
 async def health():
