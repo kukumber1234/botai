@@ -14,7 +14,7 @@ OLLAMA_GENERATE_URL = "http://127.0.0.1:11434/api/generate"
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3:8b")
 
 K_TOP = int(os.getenv("K_TOP", "8"))
-MAX_CTX_TOTAL = int(os.getenv("MAX_CTX_TOTAL", "3000"))   # символы
+MAX_CTX_TOTAL = int(os.getenv("MAX_CTX_TOTAL", "2000"))   # символы
 MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "800"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "120"))
