@@ -13,9 +13,9 @@ load_dotenv()
 OLLAMA_GENERATE_URL = "http://127.0.0.1:11434/api/generate"
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3:8b")
 
-K_TOP = int(os.getenv("K_TOP", "8"))
+K_TOP = int(os.getenv("K_TOP", "4"))
 MAX_CTX_TOTAL = int(os.getenv("MAX_CTX_TOTAL", "2000"))   # символы
-MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "800"))
+MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "900"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "120"))
 NUM_PREDICT = int(os.getenv("NUM_PREDICT", "300"))
@@ -102,8 +102,9 @@ def make_prompt(system_prompt: str, ctx: str, question: str, cites: str) -> str:
         f"{system_prompt}\n\n"
         f"КОНТЕКСТ:\n{ctx}\n\n"
         f"ВОПРОС: {question}\n\n"
-        f"Сформулируй ответ строго по контексту. Ответь как можно меньше но не потеряй смысл. "
+        f"Сформулируй ответ строго по контексту, максимум в 3 предложениях. "
         f"Закончи ответ полностью. Не обрывай предложение. "
+        f"В начале дай точный ответ на вопрос. "
         f"Если в контексте нет ответа — откажись фразой из инструкции."
     )
 
@@ -117,8 +118,8 @@ def call_ollama_generate(prompt: str, retry: int = 1) -> str:
             "num_ctx": 2048,
             "num_predict": NUM_PREDICT,
             "num_thread": 4,
-            "temperature": 0.2,
-            "repeat_penalty": 1.1,
+            "temperature": 0.1,
+            "repeat_penalty": 1.2,
         },
     }
     last_err = None
